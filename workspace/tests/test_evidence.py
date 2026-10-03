@@ -206,18 +206,165 @@ class ExportSnapshotTest(unittest.TestCase):
         v = evidence.PackView(vp["pack_id"])
         self.assertTrue(v._get("families", fid))
         self.assertTrue(v._get("versions", v2))
+        # 版本范围只含勾选修订版：同族未勾选版本绝不入包
+        self.assertFalse(v._get("versions", v1))
+        self.assertEqual({r["version_id"] for r in v.by_table["versions"]}, {v2})
+        # 实际命中勾选版本的调用随包（打开其复查），未勾选版本的调用不随包
         self.assertTrue(any(r["request_id"] == req["request_id"]
                             for r in v.by_table["requests"]))
+        self.assertTrue(all(r["version_id"] == v2 for r in v.by_table["requests"]))
+        # 批次头是调用复查的最小依赖（随包），但其未勾选基线版本是边界引用
+        self.assertTrue(v._get("rollouts", ro_id))
+        manifest = evidence.verify_bytes(
+            evidence.pack_file_bytes(vp["pack_id"])[1])["manifest"]
+        ext = {(e["table"], e["id"]) for e in manifest.get("external_refs", [])}
+        self.assertIn(("versions", v1), ext)
         self.assertTrue(evidence.verify_bytes(
             evidence.pack_file_bytes(vp["pack_id"])[1])["ok"])
         rp = evidence.build_pack(
             {"kind": "requests", "request_ids": [req["request_id"]]}, "test")
         rv = evidence.PackView(rp["pack_id"])
         self.assertTrue(rv._get("requests", req["request_id"]))
+        self.assertEqual({r["request_id"] for r in rv.by_table["requests"]},
+                         {req["request_id"]})
         self.assertTrue(rv._get("rollouts", ro_id))
         self.assertTrue(rv._get("versions", v2))
+        # 调用范围：版本只是复查依赖，不得反向带出评估/审批/兄弟调用
+        self.assertEqual(rv.by_table["eval_runs"], [])
+        self.assertEqual(rv.by_table["approvals"], [])
         self.assertTrue(evidence.verify_bytes(
             evidence.pack_file_bytes(rp["pack_id"])[1])["ok"])
+
+    def test_version_scope_excludes_sibling_stoploss_and_feedback(self):
+        """勾选单个修订版：不夹带同族其他批次的灰度/风控/回执与审计。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        req = hit_candidate(fid, "strict")
+        services.report_feedback(ro_id, f"fb-{_u()}", req["request_id"], "success", "test")
+        # 与勾选版本无关的活动：再建一个批次（基线/候选都不影响 v2 选择集合）
+        v3 = services.create_version(
+            fid, "1.2.0", INSTRUCTION_V2 + " v3", CONTRACT, ["ticket.read"],
+            PARAMS, "langfang-3-64k", "test")["version_id"]
+        services.run_evaluation(services.start_evaluation(v3, "test"), "test")
+        services.approve(v3, "release", "ops", "approved", "候选3")
+        services.cancel_rollout(ro_id, 1, "test")  # 终结 v2 批次，再建 v3 批次
+        ro3 = services.create_rollout(fid, v3, 100, "test")
+        req3 = services.invoke(fid, INPUTS, "test", request_id=f"req3-{_u()}",
+                               routing_key=f"k3-{_u()}")
+        services.configure_stoploss(ro3["rollout_id"], 3600, 5, 0.4, "test")
+        services.report_feedback(ro3["rollout_id"], f"fb3-{_u()}",
+                                 req3["request_id"], "success", "test")
+
+        vp = evidence.build_pack({"kind": "version", "version_id": v2}, "test",
+                                 shard_size_bytes=512)
+        blob = evidence.pack_file_bytes(vp["pack_id"])[1]
+        report = evidence.verify_bytes(blob)
+        self.assertTrue(report["ok"], [e["message"] for e in report["errors"]])
+        view = evidence.PackView(vp["pack_id"])
+        ids = {t: {str(r[evidence.PK[t]]) for r in view.by_table[t]}
+               for t in evidence.TABLES}
+        self.assertEqual(ids["versions"], {v2})
+        self.assertNotIn(v3, ids["versions"])
+        self.assertNotIn(req3["request_id"], ids["requests"])
+        self.assertNotIn(ro3["rollout_id"], ids["rollouts"])
+        self.assertEqual(ids["stoploss_configs"], set())
+        self.assertEqual(ids["stoploss_triggers"], set())
+        # 只保留命中勾选版本的调用的回执；v3 批次的回执不混入
+        self.assertTrue(all(r["request_id"] in ids["requests"]
+                            for r in view.by_table["feedback_receipts"]))
+        self.assertFalse(any("fb3" in r["feedback_id"]
+                             for r in view.by_table["feedback_receipts"]))
+        # 未勾选版本/批次的生命周期审计不混入（实体即包外对象）
+        self.assertTrue(all(a["entity"] != "version" or a["entity_id"] == v2
+                            for a in view.by_table["audit_log"]))
+        # 包详情/评估/调用复查页均可打开
+        self.assertIsNotNone(view.request(req["request_id"]))
+        self.assertTrue(view.eval_runs(v2))
+
+    def test_request_scope_excludes_sibling_evidence(self):
+        """勾选单个请求：只见该请求与其命中构件/批次头，不见族内其他证据。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        keep = hit_candidate(fid, "keep")
+        other = hit_candidate(fid, "other")
+        services.report_feedback(ro_id, f"fbk-{_u()}", keep["request_id"],
+                                 "success", "test")
+        services.report_feedback(ro_id, f"fbo-{_u()}", other["request_id"],
+                                 "success", "test")
+        rp = evidence.build_pack(
+            {"kind": "requests", "request_ids": [keep["request_id"]]}, "test")
+        report = evidence.verify_bytes(evidence.pack_file_bytes(rp["pack_id"])[1])
+        self.assertTrue(report["ok"], [e["message"] for e in report["errors"]])
+        view = evidence.PackView(rp["pack_id"])
+        self.assertEqual({r["request_id"] for r in view.by_table["requests"]},
+                         {keep["request_id"]})
+        self.assertFalse(view._get("requests", other["request_id"]))
+        fb_ids = {r["feedback_id"] for r in view.by_table["feedback_receipts"]}
+        self.assertTrue(all("fbo" not in x for x in fb_ids))
+        self.assertTrue(any("fbk" in x for x in fb_ids))
+        self.assertEqual(view.by_table["testsets"], [])
+        self.assertEqual(view.by_table["eval_cases"], [])
+        # 最小依赖齐全：族 / 命中版本 / 批次头 / 本请求回执与窗口 / 重演可复查
+        self.assertTrue(view._get("families", fid))
+        self.assertTrue(view._get("versions", v2))
+        self.assertTrue(view._get("rollouts", ro_id))
+        self.assertIsNotNone(view.receipt(keep["request_id"]))
+
+    def test_active_pointer_is_boundary_not_expansion(self):
+        """活动指针指向未勾选版本时不得扩大选择集合，也不留未声明悬空引用。"""
+        fid, v1, v2, _ro = make_family_with_trial()
+        # 线上指针在 v1（make_family_with_trial promote 了 v1，候选 v2 未转正）
+        vp = evidence.build_pack({"kind": "version", "version_id": v2}, "test")
+        report = evidence.verify_bytes(evidence.pack_file_bytes(vp["pack_id"])[1])
+        self.assertTrue(report["ok"], [e["message"] for e in report["errors"]])
+        view = evidence.PackView(vp["pack_id"])
+        self.assertFalse(view._get("versions", v1))
+        ext = {(e["table"], e["id"]) for e in
+               report["manifest"].get("external_refs", [])}
+        self.assertIn(("versions", v1), ext)  # 族活动指针显式声明为边界
+        fam = view.family()
+        self.assertEqual(fam["active_version_id"], v1)  # 指针值原样保留不改写
+
+    def test_undeclared_dangling_ref_still_rejected(self):
+        """边界引用必须在清单声明：手工剥掉 external_refs 并重算全部哈希后，
+        校验必须以 dangling_reference 拒绝（无边界声明则不得解析到包外）。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        hit_candidate(fid, "tamper")
+        vp = evidence.build_pack({"kind": "version", "version_id": v2}, "test")
+        blob = evidence.pack_file_bytes(vp["pack_id"])[1]
+        nl = blob.index(b"\n") + 1
+        env_line, payload = blob[:nl], blob[nl:]
+        env = json.loads(base64.b64decode(json.loads(env_line)["data"]))
+        p_lines = [ln for ln in payload.split(b"\n") if ln]
+        manifest = json.loads(base64.b64decode(json.loads(p_lines[0])["data"]))
+        self.assertTrue(manifest.get("external_refs"))
+        manifest["external_refs"] = []
+        m_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode()
+        m_sha = hashlib.sha256(m_bytes).hexdigest()
+        new_payload = evidence._line("manifest", m_sha, m_bytes) + b"".join(
+            ln + b"\n" for ln in p_lines[1:])
+        env["manifest_sha"] = m_sha
+        env["archive_sha"] = hashlib.sha256(new_payload).hexdigest()
+        size = env["shard_size_bytes"]
+        env["shards"] = [
+            {"index": i, "sha256": hashlib.sha256(ch).hexdigest(),
+             "start": s, "length": len(ch)}
+            for i, s in enumerate(range(0, len(new_payload), size), start=1)
+            for ch in [new_payload[s:s + size]]]
+        e_bytes = json.dumps(env, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode()
+        forged = evidence._line("envelope", hashlib.sha256(e_bytes).hexdigest(),
+                                e_bytes) + new_payload
+        report = evidence.verify_bytes(forged)
+        self.assertFalse(report["ok"])
+        self.assertTrue(any(e["code"] == "dangling_reference" for e in report["errors"]))
+
+    def test_family_scope_has_no_external_refs(self):
+        fid, v1, v2, ro_id = make_family_with_trial()
+        hit_candidate(fid, "fam")
+        fp = evidence.build_pack({"kind": "family", "family_id": fid}, "test")
+        manifest = evidence.verify_bytes(
+            evidence.pack_file_bytes(fp["pack_id"])[1])["manifest"]
+        self.assertEqual(manifest.get("external_refs", []), [])
 
     def test_bad_scope(self):
         with self.assertRaises(services.NotFound):
@@ -277,6 +424,38 @@ class ImportFlowTest(unittest.TestCase):
             self.assertIn("import.init", actions)
             self.assertIn("import.commit", actions)
         # 业务表为空（导入证据不回写线上状态）
+        with evidence.bind_db(self.path, init_schema=False) as c:
+            for t in ("families", "versions", "requests", "rollouts",
+                      "feedback_receipts", "eval_runs"):
+                self.assertEqual(c.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"], 0, t)
+
+    def test_scoped_pack_imports_and_opens_in_empty_instance(self):
+        """受限范围包导入空实例后：评估页/调用复查页最小依赖齐全，可打开复查；
+        未勾选修订版与风控记录不在包内；同摘要重复导入幂等且不回写业务表。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        req = hit_candidate(fid, "roundtrip")
+        services.report_feedback(ro_id, f"fb-{_u()}", req["request_id"], "success", "test")
+        vp = evidence.build_pack({"kind": "version", "version_id": v2}, "test")
+        blob = evidence.pack_file_bytes(vp["pack_id"])[1]
+        env_line, shards, _envelope = split_pack(blob)
+        iid = upload_all(self.path, env_line, shards)
+        res = commit_on(self.path, iid)
+        self.assertIsNone(res["already"], res)
+        with evidence.bind_db(self.path, init_schema=False):
+            view = evidence.PackView(res["pack_id"])
+            self.assertEqual({r["version_id"] for r in view.by_table["versions"]}, {v2})
+            self.assertTrue(view.eval_runs(v2))
+            run = view.eval_run(view.eval_runs(v2)[0]["run_id"])
+            self.assertEqual(len(run["cases"]), run["total"])
+            self.assertTrue(view.approvals(v2))
+            self.assertIsNotNone(view.request(req["request_id"]))
+            self.assertTrue(view.rollout(ro_id))
+            self.assertIsNotNone(view.receipt(req["request_id"]))
+            self.assertFalse(view._get("versions", v1))
+            self.assertEqual(view.by_table["stoploss_configs"], [])
+            again = evidence.init_import(env_line, "test")
+            self.assertEqual(again["already"], "committed")
+            self.assertEqual(again["pack_id"], res["pack_id"])
         with evidence.bind_db(self.path, init_schema=False) as c:
             for t in ("families", "versions", "requests", "rollouts",
                       "feedback_receipts", "eval_runs"):
@@ -529,6 +708,57 @@ class HttpSmokeTest(unittest.TestCase):
                      f"/evidence/packs/{pid}/requests/{reqid}/replay"):
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as resp:
                 self.assertEqual(resp.status, 200, path)
+
+    def test_scoped_pack_pages_and_api(self):
+        """勾选单个修订版/单个调用：导出/校验/下载通过，评估与复查页可开，
+        包详情与复查页不留下打不开的止损链接，清单带边界引用。"""
+        st, vers = self._req("GET", f"/api/families/{seed.FAMILY}/versions")
+        self.assertEqual(st, 200)
+        vid = vers[0]["version_id"]
+        st, vp = self._req("POST", "/api/evidence/exports",
+                           {"scope_kind": "version", "version_id": vid,
+                            "shard_size_bytes": 4096})
+        self.assertEqual(st, 201, vp)
+        vpid = vp["pack_id"]
+        st, man = self._req("GET", f"/api/evidence/packs/{vpid}/manifest")
+        self.assertEqual(st, 200)
+        # 严格选择：版本表只有勾选版本；边界引用显式声明
+        self.assertEqual({i["id"] for i in man["items"] if i["table"] == "versions"},
+                         {vid})
+        st, rep = self._req("POST", f"/api/evidence/packs/{vpid}/verify", {})
+        self.assertEqual(st, 200)
+        self.assertTrue(rep["ok"])
+        for path in (f"/evidence/packs/{vpid}",
+                     f"/evidence/packs/{vpid}/versions/{vid}/eval"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+                self.assertEqual(r.status, 200, path)
+        req_items = [i for i in man["items"] if i["table"] == "requests"]
+        for it in req_items[:1]:
+            path = f"/evidence/packs/{vpid}/requests/{it['id']}/replay"
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+                self.assertEqual(r.status, 200, path)
+                body = r.read().decode()
+            # 受限包不含止损配置时，复查页不得渲染止损历史链接（不留断链）
+            if not [i for i in man["items"] if i["table"] == "stoploss_configs"]:
+                self.assertNotIn("/stoploss", body)
+        # 调用范围
+        if req_items:
+            rid = req_items[0]["id"]
+            st, rp = self._req("POST", "/api/evidence/exports",
+                               {"scope_kind": "requests", "request_ids": [rid]})
+            self.assertEqual(st, 201, rp)
+            rpid = rp["pack_id"]
+            st, rman = self._req("GET", f"/api/evidence/packs/{rpid}/manifest")
+            self.assertEqual(st, 200)
+            self.assertEqual({i["id"] for i in rman["items"]
+                              if i["table"] == "requests"}, {rid})
+            st, rep = self._req("POST", f"/api/evidence/packs/{rpid}/verify", {})
+            self.assertEqual(st, 200)
+            self.assertTrue(rep["ok"])
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.port}/evidence/packs/{rpid}/requests/"
+                    f"{rid}/replay") as r:
+                self.assertEqual(r.status, 200)
 
     def test_shard_put_404(self):
         req = urllib.request.Request(

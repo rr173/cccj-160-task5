@@ -15,7 +15,7 @@
 {% if req.rollout_id %}
 <div class="card">
   <h2>生产推理效果回执（归档快照）
-    {% if rollout %}<a class="chip"
+    {% if can_open_stoploss %}<a class="chip"
        href="/evidence/packs/{{ pid }}/rollouts/{{ req.rollout_id }}/stoploss">止损历史 →</a>{% endif %}
   </h2>
   {% if has_receipt %}

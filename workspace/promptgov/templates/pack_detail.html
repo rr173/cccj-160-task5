@@ -75,7 +75,8 @@
           <td class="small">{{ r.weight }}% ·
             <span class="badge b-{{ r.status }}">{{ r.status }}</span> gen {{ r.generation }}
             {% if r.is_tripped %}<span class="bad">已止损</span>{% endif %}</td>
-          <td><a href="/evidence/packs/{{ pid }}/rollouts/{{ r.rollout_id }}/stoploss">打开</a></td>
+          <td>{% if r.has_stoploss %}<a href="/evidence/packs/{{ pid }}/rollouts/{{ r.rollout_id }}/stoploss">打开</a>
+            {% else %}<span class="small mut">仅批次头</span>{% endif %}</td>
         </tr>
       {% endfor %}
       {% if not rollouts %}<tr><td colspan="4" class="small mut">无放量批次。</td></tr>{% endif %}

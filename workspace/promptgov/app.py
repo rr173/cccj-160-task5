@@ -921,8 +921,9 @@ class Handler(BaseHTTPRequestHandler):
             rollouts.append({
                 "rollout_id": r["rollout_id"], "status": r["status"],
                 "weight": r["weight"], "generation": r["generation"],
-                "candidate_semver": semvers.get(r["candidate_version_id"], "?"),
-                "base_semver": semvers.get(r["base_version_id"], "?"),
+                "candidate_semver": semvers.get(r["candidate_version_id"], "?（包外）"),
+                "base_semver": semvers.get(r["base_version_id"], "?（包外）"),
+                "has_stoploss": view._get("stoploss_configs", r["rollout_id"]) is not None,
                 "is_tripped": bool(r["stoploss_tripped"]) and r["status"] == "frozen"})
         triggers = []
         for t in view.by_table["stoploss_triggers"]:
@@ -989,6 +990,10 @@ class Handler(BaseHTTPRequestHandler):
                     for r in view.replays(rid)]
         ctx = {
             "pid": pid, "family": family, "rollout": rollout,
+            # 受限范围（version/requests）只保留调用复查最小依赖：没有止损配置时
+            # 批次头在包内但止损历史页打不开，链接不渲染（不留断链）。
+            "can_open_stoploss": bool(rollout and view._get(
+                "stoploss_configs", rollout["rollout_id"])),
             "req": {"request_id": rid, "family_id": req["family_id"],
                     "family_name": family["name"], "version_id": req["version_id"],
                     "semver": semvers.get(req["version_id"], "?"),

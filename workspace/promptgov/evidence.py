@@ -1,9 +1,16 @@
 """提示治理证据包：一次发布依赖物的可迁移归档。
 
-一个证据包 = 在**同一数据库快照切点**上闭包收集的：
+一个证据包 = 在**同一数据库快照切点**上收集的：
 模板内容（版本/测试集）、评估证据（eval_runs/eval_cases）、审批、
 线上调用快照（requests）、放量事件（rollouts/replays）、止损事件
 （stoploss_configs/windows/triggers/feedback_receipts）与相关审计。
+
+范围严格性：``family`` 范围做整族完整闭包；``version`` / ``requests`` 范围是
+**受限闭包**——只含勾选对象加上打开其评估页/调用复查页的最小依赖，绝不沿
+族/批次边把同族未勾选修订版及其请求、灰度批次、止损配置/触发/整批回执夹带
+进来。受限范围解析不了的固化指针（族活动指针、批次候选/基线版本、窗口触发
+快照）在清单 ``external_refs`` 中显式声明为**边界引用**：不扩大选择集合、
+不留未声明悬空引用、不改写任何原始记录。
 
 归档格式（``.pgpack``，全部确定性、仅标准库）::
 
@@ -247,7 +254,9 @@ def _ids(clause_result) -> set[str]:
     return {str(r[0]) for r in clause_result}
 
 
-# 子实体（反向）边：父表行被纳入时必须一并纳入的从属行
+# 子实体（反向）边：族整族导出（family 范围）时，父表行被纳入即一并纳入的从属行。
+# 仅 family 范围做整族闭包；version / requests 范围走 :data:`SCOPED_CHILDREN`
+# 的受限边，不沿族/批次边扩大到未勾选的版本。
 CHILDREN: dict[str, list[tuple[str, str]]] = {
     "families": [("versions", "family_id"), ("testsets", "family_id"),
                  ("requests", "family_id"), ("rollouts", "family_id")],
@@ -264,38 +273,112 @@ CHILDREN: dict[str, list[tuple[str, str]]] = {
     "stoploss_triggers": [],
 }
 
+# 受限范围（version / requests）允许的子实体边：
+# - versions 只带自己的评估/审批/逐用例与**实际命中该版本**的调用，不碰同族其他版本；
+# - requests 只带调用自己的重演；
+# - rollout 只在"包内调用固化命中它"时才作为复查最小依赖随包，且**绝不**反向带出
+#   候选/基线版本（它们可能未被勾选）与止损配置/窗口/触发/整批回执——调用复查页只
+#   需要批次头 + 本请求自己的回执（及其窗口）；
+# - stoploss_windows 只带归属到包内调用的入账回执，不带触发快照（止损历史不在
+#   调用复查最小依赖内）。
+SCOPED_CHILDREN: dict[str, list[tuple[str, str]]] = {
+    "versions": [("approvals", "version_id"), ("eval_runs", "version_id"),
+                 ("requests", "version_id")],
+    "eval_runs": [("eval_cases", "run_id")],
+    "requests": [("replays", "request_id")],
+    "rollouts": [],
+    "stoploss_windows": [],
+}
 
-def _collect_scope(c, scope: dict) -> dict[str, set[str]]:
-    """在快照连接上按范围取种子集合，再不动点闭包展开，返回 table -> id 集合。
+# 受限范围下不允许自动闭包的出边：这些引用指向的对象若不在选择集合内，就登记为
+# 边界引用（external_refs）而不是把它拉进包。
+# - families.active_version_id：族的活动指针可能指向未勾选版本；
+# - rollouts.candidate_version_id / base_version_id：批次候选/基线可能是族内
+#   未勾选的修订版（请求复查只需批次头本身）；
+# - stoploss_windows.trigger_id：触发快照属于止损历史，不是调用复查依赖；
+# - feedback_receipts.rollout_id：批次头只由"命中它的调用"带入；回执本身不主动
+#   拉批次（批次已随调用在包内，故该引用通常可解析，只有极端并发下才成边界）。
+SCOPED_BOUNDARY_REFS: dict[str, set[str]] = {
+    "families": {"active_version_id"},
+    "rollouts": {"candidate_version_id", "base_version_id"},
+    "stoploss_windows": {"trigger_id"},
+    "feedback_receipts": {"rollout_id"},
+}
 
-    闭包沿两类边扩展：
-    - 出边（REF_FIELDS）：行引用的版本/族/批次/请求/窗口等必须随包（无悬空引用）；
-    - 子实体边（CHILDREN）：族→版本/测试集/调用/批次，版本→审批/评估，
-      测试集→用例，评估→逐用例，请求→重演，批次→止损配置/窗口/触发/回执。
 
-    因此包内始终是切点上一个完整关联闭包；切点之后才提交的行在本快照事务里
-    根本不可见（WAL 同一读快照），不会出现悬空引用或半个状态。
+def _add_children(c, chosen: dict[str, set[str]], edges: dict, table: str,
+                  ids: set[str]) -> None:
+    vals = list(ids)
+    for child_t, col in edges.get(table, []):
+        for i in range(0, len(vals), 400):
+            chunk = vals[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            chosen[child_t] |= _ids(c.execute(
+                f"SELECT {PK[child_t]} FROM {child_t} WHERE {col} IN ({ph})",
+                chunk).fetchall())
+
+
+def _rows_by_ids(c, table: str, ids: set[str]) -> list[dict]:
+    out: list[dict] = []
+    vals = list(ids)
+    for i in range(0, len(vals), 400):
+        chunk = vals[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        out.extend(dict(r) for r in c.execute(
+            f"SELECT * FROM {table} WHERE {PK[table]} IN ({ph})", chunk).fetchall())
+    return out
+
+
+def _collect_family(c, fid: str) -> dict[str, set[str]]:
+    """整族闭包（family 范围）：原有语义，沿全部出边 + 子实体边到不动点。"""
+    chosen: dict[str, set[str]] = {t: set() for t in TABLES}
+    chosen["families"].add(fid)
+    for _ in range(32):
+        before = sum(len(s) for s in chosen.values())
+        for table in (t for t in TABLES if chosen[t]):
+            _add_children(c, chosen, CHILDREN, table, chosen[table])
+        for table, ids in ((t, chosen[t]) for t in TABLES if chosen[t]):
+            for row in _rows_by_ids(c, table, ids):
+                for ref in _refs_of(table, row):
+                    chosen[ref["table"]].add(ref["id"])
+        if sum(len(s) for s in chosen.values()) == before:
+            break
+    # 触发快照反向引用窗口（窗口 trigger_id 也可能回指触发）
+    for t in list(chosen["stoploss_triggers"]):
+        row = c.execute("SELECT window_id FROM stoploss_triggers WHERE trigger_id=?",
+                        (t,)).fetchone()
+        if row:
+            chosen["stoploss_windows"].add(row["window_id"])
+    return chosen
+
+
+def _collect_scoped(c, scope: dict) -> tuple[dict[str, set[str]], set[tuple[str, str]]]:
+    """version / requests 范围的**受限闭包**。
+
+    选择集合严格限定为勾选对象 + 打开其评估/调用复查页所需最小依赖；任何会把
+    同族未勾选修订版（及其请求、灰度、风控记录）拉进包的边都不展开，解析不了的
+    固化指针登记为边界引用（external_refs），清单显式声明，既不扩大集合也不留
+    未声明的悬空引用。
     """
     kind = scope.get("kind")
     chosen: dict[str, set[str]] = {t: set() for t in TABLES}
+    # 只有"勾选本身"的版本才展开评估/审批/调用子边；作为所选调用依赖被带入的
+    # 版本只是复查最小依赖（四要素/绑定模型），不得反向带出同族评估或兄弟调用。
+    root_versions: set[str] = set()
 
     def add(table: str, rid: Any):
         if rid is not None and rid != "":
             chosen[table].add(str(rid))
 
-    if kind == "family":
-        fid = scope.get("family_id")
-        if not c.execute("SELECT 1 FROM families WHERE family_id=?", (fid,)).fetchone():
-            raise NotFound(f"模板族不存在: {fid}")
-        add("families", fid)
-    elif kind == "version":
+    if kind == "version":
         vid = scope.get("version_id")
         row = c.execute("SELECT * FROM versions WHERE version_id=?", (vid,)).fetchone()
         if not row:
             raise NotFound(f"版本不存在: {vid}")
-        add("families", row["family_id"])   # 版本所属族随包
+        add("families", row["family_id"])   # 页头/族标识：最小依赖
         add("versions", vid)
-    elif kind == "requests":
+        root_versions.add(str(vid))
+    else:  # requests
         rids = scope.get("request_ids") or []
         if not rids:
             raise DomainError("调用范围必须提供非空 request_ids")
@@ -306,61 +389,110 @@ def _collect_scope(c, scope: dict) -> dict[str, set[str]]:
                 raise NotFound(f"请求不存在: {rid}")
             add("families", row["family_id"])
             add("requests", rid)
-    else:
-        raise DomainError("scope.kind 必须是 family / version / requests")
 
-    def add_children(parents: dict[str, set[str]]) -> None:
-        for table, ids in parents.items():
-            if not ids:
-                continue
-            vals = list(ids)
-            for child_t, col in CHILDREN.get(table, []):
-                for i in range(0, len(vals), 400):
-                    chunk = vals[i:i + 400]
-                    ph = ",".join("?" * len(chunk))
-                    chosen[child_t] |= _ids(c.execute(
-                        f"SELECT {PK[child_t]} FROM {child_t} WHERE {col} IN ({ph})",
-                        chunk).fetchall())
-
-    # 不动点：出边 + 子实体边，直到集合稳定
-    for _ in range(16):
+    # 受限子实体边到不动点：勾选版本→评估/审批/命中本版本的调用，评估→逐用例，
+    # 调用→重演。测试集/用例经出边闭包补入（只补评估实际引用的那一份/那几条）。
+    for _ in range(32):
         before = sum(len(s) for s in chosen.values())
-        add_children({t: s for t, s in chosen.items() if t in CHILDREN})
-        for table, ids in list(chosen.items()):
-            if not ids:
-                continue
-            vals = list(ids)
-            for i in range(0, len(vals), 400):
-                chunk = vals[i:i + 400]
-                ph = ",".join("?" * len(chunk))
-                for row in c.execute(
-                        f"SELECT * FROM {table} WHERE {PK[table]} IN ({ph})",
-                        chunk).fetchall():
-                    for ref in _refs_of(table, dict(row)):
-                        add(ref["table"], ref["id"])
+        for table in (t for t in TABLES if chosen[t]):
+            ids = chosen[table]
+            if table == "versions":
+                ids = {v for v in ids if v in root_versions}
+            _add_children(c, chosen, SCOPED_CHILDREN, table, ids)
+        # 出边：除边界边外全部解析（version→family、eval→version/testset、
+        # eval_case→run/testcase、request→version、receipt→window/request、
+        # window→rollout 等），只补最小依赖，不跨族/不跨版本蔓延。
+        for table, ids in ((t, chosen[t]) for t in TABLES if chosen[t]):
+            boundary = SCOPED_BOUNDARY_REFS.get(table, set())
+            for row in _rows_by_ids(c, table, ids):
+                for col, target in REF_FIELDS[table]:
+                    if col in boundary:
+                        continue
+                    val = row.get(col)
+                    if val is not None and val != "":
+                        chosen[target].add(str(val))
         if sum(len(s) for s in chosen.values()) == before:
             break
 
-    # 止损触发快照会反向引用窗口，窗口 trigger_id 也可能指向触发：补一条显式边
-    for t in list(chosen["stoploss_triggers"]):
-        row = c.execute("SELECT window_id FROM stoploss_triggers WHERE trigger_id=?",
-                        (t,)).fetchone()
-        if row:
-            add("stoploss_windows", row["window_id"])
-    # 相关审计：实体即包内对象（audit entity 命名映射到闭包表），或明细文本提到
-    # 包内放量批次（被拒/重复回执等只写审计的止损事件，entity_id 是 feedback_id
-    # 而不会成为对象）。
+    # 调用复查最小依赖收尾：
+    # 1) 包内调用固化命中的批次头随包（不展开批次的任何子实体边）；
+    # 2) 入账回执只取"请求在包内"的那些，连同其窗口（不带触发快照）。
+    for row in _rows_by_ids(c, "requests", chosen["requests"]):
+        if row.get("rollout_id"):
+            chosen["rollouts"].add(str(row["rollout_id"]))
+    if chosen["requests"]:
+        vals = list(chosen["requests"])
+        all_rids: set[str] = set()
+        for i in range(0, len(vals), 400):
+            chunk = vals[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            all_rids |= _ids(c.execute(
+                f"SELECT feedback_id FROM feedback_receipts WHERE request_id IN ({ph})",
+                chunk).fetchall())
+        chosen["feedback_receipts"] |= all_rids
+    for row in _rows_by_ids(c, "feedback_receipts", chosen["feedback_receipts"]):
+        add("stoploss_windows", row.get("window_id"))
+        add("rollouts", row.get("rollout_id"))
+
+    # 边界引用：被受限边拦住、最终未入包的固化指针（活动指针/批次候选基线/
+    # 触发快照等）。清单显式声明，校验侧据此允许"有界外部引用"。
+    external: set[tuple[str, str]] = set()
+    for table, ids in ((t, chosen[t]) for t in TABLES if chosen[t]):
+        for row in _rows_by_ids(c, table, ids):
+            for col, target in REF_FIELDS[table]:
+                val = row.get(col)
+                if val is None or val == "":
+                    continue
+                if str(val) not in chosen[target]:
+                    external.add((target, str(val)))
+    return chosen, external
+
+
+def _audit_ids_for(c, chosen: dict[str, set[str]], *, scoped: bool) -> set[str]:
+    """选择相关审计：实体即包内对象的审计动作。
+
+    family 范围额外保留文本提到包内批次的 feedback 审计（被拒/重复回执只有审计、
+    没有实体行）；受限范围不做该文本匹配——被拒回执属于未勾选的止损事件，
+    不得借批次头混入版本/调用包。
+    """
     universe = {(t, i) for t, s in chosen.items() if t != "audit_log" for i in s}
     rollout_ids = chosen["rollouts"]
+    out: set[str] = set()
     for a in c.execute("SELECT * FROM audit_log ORDER BY id").fetchall():
         a = dict(a)
         tbl = AUDIT_ENTITY_TABLE.get(a["entity"])
         if tbl and (tbl, str(a["entity_id"])) in universe:
-            add("audit_log", a["id"])
-        elif a["entity"] == "feedback" and any(f"rollout={rid}" in a["detail"]
-                                               for rid in rollout_ids):
-            add("audit_log", a["id"])
-    return chosen
+            out.add(str(a["id"]))
+        elif not scoped and a["entity"] == "feedback" and any(
+                f"rollout={rid}" in a["detail"] for rid in rollout_ids):
+            out.add(str(a["id"]))
+    return out
+
+
+def _collect_scope(c, scope: dict) -> tuple[dict[str, set[str]], set[tuple[str, str]]]:
+    """在快照连接上按范围取种子集合并做闭包展开。
+
+    返回 ``(table -> id 集合, 边界引用集合)``。切点之后才提交的行在本快照事务里
+    不可见（WAL 同一读快照），不会出现半个状态。
+
+    - family 范围：整族完整关联闭包（无边界引用）；
+    - version / requests 范围：受限闭包，严格限定可见证据集合，未勾选修订版及其
+      请求/灰度/风控记录绝不入包；解析不了的固化指针显式登记为边界引用。
+    """
+    kind = scope.get("kind")
+    if kind == "family":
+        fid = scope.get("family_id")
+        if not c.execute("SELECT 1 FROM families WHERE family_id=?", (fid,)).fetchone():
+            raise NotFound(f"模板族不存在: {fid}")
+        chosen = _collect_family(c, fid)
+        external: set[tuple[str, str]] = set()
+        chosen["audit_log"] = _audit_ids_for(c, chosen, scoped=False)
+    elif kind in ("version", "requests"):
+        chosen, external = _collect_scoped(c, scope)
+        chosen["audit_log"] = _audit_ids_for(c, chosen, scoped=True)
+    else:
+        raise DomainError("scope.kind 必须是 family / version / requests")
+    return chosen, external
 
 
 def _load_rows(c, chosen: dict[str, set[str]]) -> dict[str, list[dict]]:
@@ -396,7 +528,7 @@ def build_pack(scope: dict, actor: str = "api", shard_size_bytes: int | None = N
                     "db_time": cutpoint["db_time"]}
         if snapshot_callback:
             snapshot_callback(cutpoint)
-        chosen = _collect_scope(c, scope)
+        chosen, external_refs = _collect_scope(c, scope)
         rows = _load_rows(c, chosen)
 
     semvers = {r["version_id"]: r["semver"] for r in rows["versions"]}
@@ -412,13 +544,17 @@ def build_pack(scope: dict, actor: str = "api", shard_size_bytes: int | None = N
             })
     items.sort(key=lambda it: (TABLES.index(it["table"]), it["id"]))
     counts = {t: len(rows[t]) for t in TABLES}
+    # 边界引用（仅受限范围可能非空）：包内对象指向、但按选择语义不属于可见证据
+    # 集合的固化指针（族活动指针、批次候选/基线版本、触发快照等）。清单显式声明，
+    # 校验时这些引用允许解析不到，其余引用必须全部可解析。
+    external = [{"table": t, "id": i} for t, i in sorted(external_refs)]
 
     exported_at = cutpoint["db_time"]
     source_iid = instance_id()
     manifest = {
         "format": FORMAT, "pack_id": pack_id, "scope": scope, "cutpoint": cutpoint,
         "source_instance_id": source_iid, "exported_at": exported_at,
-        "items": items, "counts": counts,
+        "items": items, "counts": counts, "external_refs": external,
     }
     m_bytes = _canonical(manifest)
     m_sha = core.sha256_hex(m_bytes.decode("utf-8"))
@@ -609,11 +745,24 @@ def verify_bytes(file_bytes: bytes) -> dict:
             if int(counts.get(t, 0)) != n:
                 _err(errors, "count_mismatch", f"计数不符：{t} 清单 {counts.get(t, 0)} 实际 {n}")
 
-    # —— 引用闭包：不允许悬空引用 ——
+    # —— 引用闭包：除清单显式声明的边界引用外，不允许悬空引用 ——
+    ext_decl = manifest.get("external_refs", []) if manifest else []
+    external: set[tuple[str, str]] = set()
+    for r in ext_decl:
+        try:
+            external.add((str(r["table"]), str(r["id"])))
+        except (KeyError, TypeError):
+            _err(errors, "external_ref_malformed", f"边界引用条目损坏：{r!r}")
+    # 声明的边界引用必须确实不在包内（若已在包内就不是边界，属于清单错误）
+    for t, i in sorted(external):
+        if (t, i) in by_key:
+            _err(errors, "external_ref_included",
+                 f"边界引用 {t}/{i} 已在包内，不应声明为 external_refs")
     for (table, rid), rec in by_key.items():
         for ref in next((it["refs"] for it in items
                          if it["table"] == table and it["id"] == rid), []):
-            if (ref["table"], ref["id"]) not in by_key:
+            key = (ref["table"], ref["id"])
+            if key not in by_key and key not in external:
                 _err(errors, "dangling_reference",
                      f"{table}/{rid} 引用了包内不存在的 {ref['table']}/{ref['id']}")
 
@@ -621,8 +770,74 @@ def verify_bytes(file_bytes: bytes) -> dict:
         return by_key.get((table, str(rid)))
 
     # —— 语义不变量 ——
+    scope = manifest.get("scope", {}) if manifest else {}
+    scope_kind = scope.get("kind")
+    scope_versions = {str(scope.get("version_id", ""))} if scope_kind == "version" else set()
+    scope_requests = {str(r) for r in scope.get("request_ids", []) or []}
+
+    def missing(table: str, rid: Any) -> bool:
+        """对象既不在包内、也未声明为边界引用 = 真缺失。"""
+        return not rec_of(table, rid) and (table, str(rid)) not in external
+
+    # 选择集合约束：受限范围内版本表只能含勾选版本；版本范围的调用必须实际命中
+    # 勾选版本；调用范围的调用必须全部在 request_ids 内。未勾选修订版及其请求、
+    # 灰度、风控记录混入即拒绝（自检必须能发现选择集合被扩大）。
+    if scope_kind == "version":
+        for _vid, v in ((k[1], r) for k, r in by_key.items() if k[0] == "versions"):
+            if str(v.get("version_id")) not in scope_versions:
+                _err(errors, "scope_version_leak",
+                     f"版本范围包混入了未勾选版本 {_vid}（选择集合被扩大）")
+        for _rid, req in ((k[1], r) for k, r in by_key.items()
+                          if k[0] == "requests"):
+            if str(req.get("version_id")) not in scope_versions:
+                _err(errors, "scope_request_leak",
+                     f"版本范围包混入了未勾选版本的调用 {_rid}（选择集合被扩大）")
+    if scope_kind == "requests":
+        for _rid, req in ((k[1], r) for k, r in by_key.items()
+                          if k[0] == "requests"):
+            if str(req.get("request_id")) not in scope_requests:
+                _err(errors, "scope_request_leak",
+                     f"调用范围包混入了未勾选调用 {_rid}（选择集合被扩大）")
+    if scope_kind in ("version", "requests"):
+        # 止损配置/触发快照不属于"打开所选评估、请求复查"的最小依赖，不得夹带；
+        # 回执只能属于包内调用；批次头只能是包内调用固化命中或被包内回执引用的。
+        if any(k[0] == "stoploss_configs" for k in by_key):
+            _err(errors, "scope_stoploss_leak", "受限范围包不得夹带止损配置")
+        if any(k[0] == "stoploss_triggers" for k in by_key):
+            _err(errors, "scope_stoploss_leak", "受限范围包不得夹带止损触发快照")
+        req_ids = {str(r.get("request_id"))
+                   for (t, _i), r in by_key.items() if t == "requests"}
+        for _fb, fb in ((k[1], r) for k, r in by_key.items()
+                        if k[0] == "feedback_receipts"):
+            if str(fb.get("request_id")) not in req_ids:
+                _err(errors, "scope_receipt_leak",
+                     f"受限范围包夹带了包外调用的回执 {_fb}")
+        # 边界引用只允许来自三类固化指针：族活动指针、批次候选/基线、窗口触发
+        allowed_boundary = {
+            "families": {"active_version_id"},
+            "rollouts": {"candidate_version_id", "base_version_id"},
+            "stoploss_windows": {"trigger_id"},
+            "feedback_receipts": {"rollout_id"},
+        }
+        for (table, rid), rec in by_key.items():
+            for col, target in REF_FIELDS.get(table, []):
+                val = rec.get(col)
+                if val is None or val == "":
+                    continue
+                if (target, str(val)) in external and \
+                        col not in allowed_boundary.get(table, set()):
+                    _err(errors, "scope_boundary_illegal",
+                         f"{table}/{rid} 的 {col} 不是允许的边界引用类型")
+        # family 范围的闭包不应产生任何边界引用；受限范围边界引用必须可溯源到
+        # 包内某对象的真实出边（ext_by_src 在下面引用循环里已隐式覆盖）。
+    if scope_kind == "family":
+        fid = scope.get("family_id")
+        for (t, i) in external:
+            _err(errors, "family_scope_external",
+                 f"整族闭包不应存在边界引用：{t}/{i}（family_id={fid}）")
+
     for fid, f in ((k[1], r) for k, r in by_key.items() if k[0] == "families"):
-        if f.get("active_version_id") and not rec_of("versions", f["active_version_id"]):
+        if f.get("active_version_id") and missing("versions", f["active_version_id"]):
             _err(errors, "family_active_dangling", f"族 {fid} 的线上指针悬空")
     for vid, v in ((k[1], r) for k, r in by_key.items() if k[0] == "versions"):
         try:
@@ -654,7 +869,7 @@ def verify_bytes(file_bytes: bytes) -> dict:
             _err(errors, "eval_version_missing", f"评估 {run_id} 缺少版本对象")
     for ro_id, ro in ((k[1], r) for k, r in by_key.items() if k[0] == "rollouts"):
         for fld in ("candidate_version_id", "base_version_id"):
-            if not rec_of("versions", ro.get(fld)):
+            if missing("versions", ro.get(fld)):
                 _err(errors, "rollout_version_missing",
                      f"批次 {ro_id} 的 {fld} 对象缺失")
         if not rec_of("families", ro.get("family_id")):
@@ -667,7 +882,7 @@ def verify_bytes(file_bytes: bytes) -> dict:
         elif str(req.get("rollout_id") or "") != str(fb.get("rollout_id")):
             _err(errors, "receipt_rollout_mismatch",
                  f"回执 {fb_id} 的批次与调用固化批次不一致")
-        if not rec_of("stoploss_windows", fb.get("window_id")):
+        if missing("stoploss_windows", fb.get("window_id")):
             _err(errors, "receipt_window_missing", f"回执 {fb_id} 缺少统计窗口")
     for req_id, req in ((k[1], r) for k, r in by_key.items() if k[0] == "requests"):
         v = rec_of("versions", req.get("version_id"))
