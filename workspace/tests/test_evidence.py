@@ -214,10 +214,195 @@ class ExportSnapshotTest(unittest.TestCase):
             {"kind": "requests", "request_ids": [req["request_id"]]}, "test")
         rv = evidence.PackView(rp["pack_id"])
         self.assertTrue(rv._get("requests", req["request_id"]))
-        self.assertTrue(rv._get("rollouts", ro_id))
         self.assertTrue(rv._get("versions", v2))
         self.assertTrue(evidence.verify_bytes(
             evidence.pack_file_bytes(rp["pack_id"])[1])["ok"])
+
+    def test_version_scope_is_strict_no_sibling_or_rollout_leak(self):
+        """勾选单个修订版：未勾选修订版及其请求、灰度批次与风控记录一律不入包；
+        落在范围外的结构边（活动指针/批次/窗口）逐项声明为 external_refs，
+        自检通过且无断链。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        req = hit_candidate(fid, "strict")
+        services.report_feedback(ro_id, f"fb-{_u()}", req["request_id"], "success", "test")
+        # v1 是当前活动指针（族指针指向未勾选修订版）——必须不展开、不断链
+        fam = services.get_family(fid)
+        self.assertEqual(fam["active_version_id"], v1)
+
+        vp = evidence.build_pack({"kind": "version", "version_id": v2}, "test")
+        v = evidence.PackView(vp["pack_id"])
+        # —— 未勾选修订版及其请求/审批/评估不得夹带 ——
+        self.assertIsNone(v._get("versions", v1), "未勾选修订版不得入包")
+        self.assertEqual(len(v.by_table["versions"]), 1)
+        self.assertEqual({x["version_id"] for x in v.by_table["versions"]}, {v2})
+        # —— 灰度与风控记录不得夹带 ——
+        self.assertEqual(v.by_table["rollouts"], [])
+        self.assertEqual(v.by_table["stoploss_configs"], [])
+        self.assertEqual(v.by_table["stoploss_windows"], [])
+        self.assertEqual(v.by_table["stoploss_triggers"], [])
+        # 命中所选版本的调用及其入账回执保留（复查最小依赖）
+        self.assertTrue(any(r["request_id"] == req["request_id"]
+                            for r in v.by_table["requests"]))
+        self.assertEqual(len(v.by_table["feedback_receipts"]), 1)
+        # 评估证据 + 固定测试集 + 审批随所选版本保留
+        self.assertTrue(v.by_table["eval_runs"])
+        self.assertTrue(v.by_table["testcases"])
+        self.assertTrue(v.by_table["approvals"])
+        # 审计不得夹带族级 promote/rollback（明细含兄弟版本 id）
+        actions = {a["action"] for a in v.by_table["audit_log"]}
+        self.assertNotIn("version.promote", actions)
+        self.assertNotIn("version.rollback", actions)
+        for a in v.by_table["audit_log"]:
+            self.assertNotIn(v1, str(a["detail"]),
+                            "窄包审计明细不得泄露未勾选版本 id")
+        # —— 边界外部引用显式声明 ——
+        ext = {(it["table"], r["table"], r["id"])
+               for it in v.manifest["items"] for r in it.get("external_refs", [])}
+        self.assertIn(("families", "versions", v1), ext, "活动指针须声明为边界引用")
+        self.assertIn(("requests", "rollouts", ro_id), ext)
+        receipt = v.by_table["feedback_receipts"][0]
+        self.assertIn(("feedback_receipts", "rollouts", ro_id), ext)
+        self.assertIn(("feedback_receipts", "stoploss_windows",
+                       receipt["window_id"]), ext)
+        # 所有包内 refs 必须可解析（无断链）
+        for it in v.manifest["items"]:
+            for r in it["refs"]:
+                self.assertIsNotNone(v._get(r["table"], r["id"]),
+                                     f"{it['table']}/{it['id']} 断链 {r}")
+        # 自检通过
+        self.assertTrue(evidence.verify_bytes(
+            evidence.pack_file_bytes(vp["pack_id"])[1])["ok"])
+
+    def test_request_scope_is_strict(self):
+        """调用范围：只含勾选调用、命中版本、重演与已入账回执；不夹带批次/风控/
+        兄弟版本，也不夹带命中版本的审批与评估。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        req_hit = hit_candidate(fid, "hit")          # 命中候选 v2
+        services.report_feedback(ro_id, f"fb-{_u()}", req_hit["request_id"],
+                                 "success", "test")
+        # 一条命中基线 v1 的调用（冻结前权重 100% 不会命中基线；直接构造：
+        # 用未参与放量的 routing 之外的普通调用走当前活动指针 v1——需要先冻结）
+        services.freeze_rollout(ro_id, 1, "test")
+        req_base = services.invoke(fid, INPUTS, "test",
+                                   request_id=f"req-base-{_u()}",
+                                   routing_key=f"bk-{_u()}")
+        self.assertEqual(req_base["version_id"], v1)
+
+        pack = evidence.build_pack(
+            {"kind": "requests", "request_ids": [req_hit["request_id"]]}, "test")
+        view = evidence.PackView(pack["pack_id"])
+        self.assertEqual({r["request_id"] for r in view.by_table["requests"]},
+                         {req_hit["request_id"]})
+        self.assertEqual({x["version_id"] for x in view.by_table["versions"]}, {v2})
+        self.assertIsNone(view._get("versions", v1))
+        self.assertEqual(view.by_table["rollouts"], [])
+        self.assertEqual(view.by_table["stoploss_configs"], [])
+        self.assertEqual(view.by_table["stoploss_windows"], [])
+        self.assertEqual(view.by_table["stoploss_triggers"], [])
+        self.assertEqual(view.by_table["approvals"], [])
+        self.assertEqual(view.by_table["eval_runs"], [])
+        self.assertEqual(view.by_table["testsets"], [])
+        self.assertEqual(len(view.by_table["feedback_receipts"]), 1)
+        ext = {(it["table"], r["table"], r["id"])
+               for it in view.manifest["items"] for r in it.get("external_refs", [])}
+        self.assertIn(("requests", "rollouts", ro_id), ext)
+        self.assertIn(("families", "versions", v1), ext)
+        self.assertTrue(evidence.verify_bytes(
+            evidence.pack_file_bytes(pack["pack_id"])[1])["ok"])
+
+        # 多个勾选调用跨命中构件：两个版本都随包，但仍无批次/风控
+        pack2 = evidence.build_pack(
+            {"kind": "requests",
+             "request_ids": [req_hit["request_id"], req_base["request_id"]]}, "test")
+        v2view = evidence.PackView(pack2["pack_id"])
+        self.assertEqual({x["version_id"] for x in v2view.by_table["versions"]},
+                         {v1, v2})
+        self.assertEqual(v2view.by_table["rollouts"], [])
+        self.assertTrue(evidence.verify_bytes(
+            evidence.pack_file_bytes(pack2["pack_id"])[1])["ok"])
+
+    def test_narrow_pack_roundtrip_import_and_pages_open(self):
+        """窄包导入空实例后，所选评估页与调用复查页所需最小依赖完整可打开；
+        边界对象（批次/窗口/未勾选版本）不在包内但不断链。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        req = hit_candidate(fid, "roundtrip")
+        services.report_feedback(ro_id, f"fb-{_u()}", req["request_id"], "success", "test")
+        pack = evidence.build_pack({"kind": "version", "version_id": v2}, "test")
+        blob = evidence.pack_file_bytes(pack["pack_id"])[1]
+        env_line, shards, _ = split_pack(blob)
+        path = fresh_target_db()
+        iid = upload_all(path, env_line, shards)
+        res = commit_on(path, iid)
+        with evidence.bind_db(path, init_schema=False):
+            view = evidence.PackView(res["pack_id"])
+            # 评估页最小依赖
+            self.assertTrue(view.eval_runs(v2))
+            run = view.eval_runs(v2)[0]
+            self.assertEqual(len(view.eval_run(run["run_id"])["cases"]), run["total"])
+            self.assertTrue(view.approvals(v2))
+            # 调用复查页最小依赖：调用、命中版本、回执、族头
+            self.assertIsNotNone(view.request(req["request_id"]))
+            self.assertIsNotNone(view._get("versions", v2))
+            self.assertIsNotNone(view.receipt(req["request_id"]))
+            self.assertIsNone(view.rollout(ro_id), "边界批次不入包")
+            # 边界引用仍在清单中
+            ext = {(it["table"], r["table"], r["id"])
+                   for it in view.manifest["items"] for r in it.get("external_refs", [])}
+            self.assertIn(("families", "versions", v1), ext)
+
+    def test_undeclared_boundary_ref_is_rejected(self):
+        """篡改者把内部 refs 从清单删掉以制造断链：落库前校验必须 422 拒绝。"""
+        fid, v1, v2, ro_id = make_family_with_trial()
+        hit_candidate(fid, "tamper")
+        pack = evidence.build_pack({"kind": "version", "version_id": v2}, "test",
+                                   shard_size_bytes=4096)
+        blob = evidence.pack_file_bytes(pack["pack_id"])[1]
+        lines = [ln for ln in blob.split(b"\n") if ln]
+        # 找到 requests 对象行：其记录内含 rollout_id；攻击者重算对象哈希但
+        # 无法同步清单（清单哈希进信封），构造一个把 requests 行的 external
+        # 声明清空、且把对象从载荷删掉的变体不可行（对象数会变），因此直接
+        # 校验 verify_bytes 对"引用不可解析且未声明"的合成包报错：用最小方式
+        # 验证——篡改清单中 families 项的 external_refs（清单行哈希会不符）。
+        report = evidence.verify_bytes(blob)
+        self.assertTrue(report["ok"])
+        # 直接构造：把 families 对象的 active_version_id 清掉会触发内容哈希不符；
+        # 这里验证校验链对边界声明缺失敏感：手工从 manifest items 移除外部声明。
+        env_l = lines[0]
+        envelope = json.loads(base64.b64decode(json.loads(env_l)["data"]))
+        payload = b"\n".join(lines[1:]) + b"\n"
+        man_wrapper = json.loads(payload.split(b"\n", 1)[0])
+        manifest = json.loads(base64.b64decode(man_wrapper["data"]))
+        for it in manifest["items"]:
+            it.pop("external_refs", None)
+        # 重算清单与载荷、信封（模拟能改一切但保留 families→v1 边界的场景）
+        m_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode()
+        # 对象行原样保留；只替换清单行
+        obj_lines = payload.split(b"\n")[1:]
+        new_man_line = json.dumps(
+            {"kind": "manifest",
+             "sha256": hashlib.sha256(m_bytes).hexdigest(),
+             "data": base64.b64encode(m_bytes).decode()}).encode()
+        new_payload = new_man_line + b"\n" + b"\n".join(obj_lines)
+        env2 = dict(envelope)
+        env2["manifest_sha"] = hashlib.sha256(m_bytes).hexdigest()
+        env2["archive_sha"] = hashlib.sha256(new_payload).hexdigest()
+        size = env2["shard_size_bytes"]
+        chunks = [new_payload[s:s + size] for s in range(0, len(new_payload), size)]
+        env2["shards"] = [{"index": i + 1, "sha256": hashlib.sha256(ch).hexdigest(),
+                           "start": i * size, "length": len(ch)}
+                          for i, ch in enumerate(chunks)]
+        e_bytes = json.dumps(env2, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode()
+        forged = json.dumps({"kind": "envelope",
+                             "sha256": hashlib.sha256(e_bytes).hexdigest(),
+                             "data": base64.b64encode(e_bytes).decode()}).encode() \
+            + b"\n" + new_payload
+        report2 = evidence.verify_bytes(forged)
+        self.assertFalse(report2["ok"])
+        self.assertTrue(any(e["code"] == "dangling_reference" for e in report2["errors"]),
+                        [e["code"] for e in report2["errors"]])
+
 
     def test_bad_scope(self):
         with self.assertRaises(services.NotFound):

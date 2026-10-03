@@ -10,10 +10,14 @@
   <form method="post" action="/ui/evidence/exports">
     <label>选择范围</label>
     <select name="scope_kind" id="kind">
-      <option value="family" {% if kind == 'family' %}selected{% endif %}>按模板族（全量关联闭包）</option>
-      <option value="version" {% if kind == 'version' %}selected{% endif %}>按单个版本（模板/证据/审批/命中调用）</option>
-      <option value="requests" {% if kind == 'requests' %}selected{% endif %}>按调用范围（指定 request_id 列表）</option>
+      <option value="family" {% if kind == 'family' %}selected{% endif %}>按模板族（该族全部版本/调用/批次/止损的完整闭包）</option>
+      <option value="version" {% if kind == 'version' %}selected{% endif %}>按单个版本（仅勾选版本 + 其评估/审批/测试集 + 命中该版本的调用/回执）</option>
+      <option value="requests" {% if kind == 'requests' %}selected{% endif %}>按调用范围（仅勾选调用 + 命中版本 + 重演/回执）</option>
     </select>
+    <p class="small mut">按版本/调用范围导出时，未勾选的同族修订版及其请求、放量批次、
+      止损配置/窗口/触发均<b>不会进入证据包</b>；指向它们的活动指针/批次/窗口边在清单
+      <span class="mono">external_refs</span> 中逐项声明为范围边界（不断链、自检可识别），
+      打开所选评估与所选调用复查所需的最小依赖始终完整。</p>
 
     <label>模板族 family_id（按模板族时使用）</label>
     <select name="family_id">
